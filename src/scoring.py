@@ -46,20 +46,61 @@ def decide(scored: pl.DataFrame, threshold: float = 0.68, one_to_one: bool = Tru
     return out
 
 
-def decide_frame(scored: pl.DataFrame, threshold: float = 0.68, one_to_one: bool = True,
-                 margin: float = 0.0) -> pl.DataFrame:
-    """Frame version of ``decide`` (columns s1_id, cand_id kept).
+def decide_robust_frame(scored: pl.DataFrame, a_meta: pl.DataFrame, b_meta: pl.DataFrame,
+                        threshold: float = 0.68, one_to_one: bool = True,
+                        margin: float = 0.03) -> pl.DataFrame:
+    """Multi-Layer Robust Decision Engine for Maximizing Macro F0.5.
 
-    Precision-optimized for Challenge Metric (Macro F0.5):
-    - Rejects low-confidence pairs below threshold (default 0.68)
-    - Enforces 1-to-1 matching: each S2/S3 candidate goes strictly to its argmax S1 entity
+    1. Joins metadata to inspect house numbers, exact compact names, and states.
+    2. Layer A (Distractor Rejection): Conflicting house numbers penalized (p_eff = p - 0.14).
+    3. Layer B (High-Confidence Agreement): Exact compact names & matching states boosted (p_eff = p + 0.04).
+    4. Layer C (Optimal Boundary): Filters p_eff >= threshold.
+    5. Layer D (1-to-1 Argmax): Assigns candidate uniquely to best S1 entity.
+    6. Layer E (Confidence Margin): Protects singletons from marginal ambiguous matches.
     """
-    df = scored.filter(pl.col("p") >= threshold)
+    if not scored.height:
+        return pl.DataFrame({"s1_id": [], "cand_id": []})
+
+    # Join metadata
+    a_m = a_meta.select(s1_id="a_idx", name_cmp_a="name_compact", house_a="house_no", st_a="state")
+    b_m = b_meta.select(cand_id="b_idx", name_cmp_b="name_compact", house_b="house_no", st_b="state")
+
+    df = (scored
+          .join(a_m, on="s1_id", how="inner")
+          .join(b_m, on="cand_id", how="inner"))
+
+    # Calculate effective probability
+    # If house numbers both exist and conflict: penalty of 0.14
+    is_house_conflict = (pl.col("house_a") != "") & (pl.col("house_b") != "") & (pl.col("house_a") != pl.col("house_b"))
+    # If exact compact name and same state: boost of 0.04
+    is_exact_name_state = (pl.col("name_cmp_a") != "") & (pl.col("name_cmp_a") == pl.col("name_cmp_b")) & ((pl.col("st_a") == "") | (pl.col("st_a") == pl.col("st_b")))
+
+    df = df.with_columns(
+        p_eff=(pl.col("p")
+               - pl.when(is_house_conflict).then(0.14).otherwise(0.0)
+               + pl.when(is_exact_name_state).then(0.04).otherwise(0.0))
+    )
+
+    # Filter by threshold
+    df = df.filter(pl.col("p_eff") >= threshold)
     if not df.height:
-        return pl.DataFrame({"s1_id": pl.Series([], dtype=scored["s1_id"].dtype),
-                             "cand_id": pl.Series([], dtype=scored["cand_id"].dtype)})
+        return pl.DataFrame({"s1_id": [], "cand_id": []})
+
+    # 1-to-1 argmax per candidate
     if one_to_one:
-        df = df.sort("p", descending=True).unique(subset=["cand_id"], keep="first", maintain_order=True)
+        df = df.sort("p_eff", descending=True).unique(subset=["cand_id"], keep="first", maintain_order=True)
+
+    # Margin check per S1 entity
+    if margin > 0.0:
+        df = df.with_columns(
+            p_max=pl.col("p_eff").max().over("s1_id"),
+            n_cands=pl.len().over("s1_id")
+        ).with_columns(
+            p_gap=pl.col("p_max") - pl.col("p_eff")
+        ).filter(
+            (pl.col("n_cands") == 1) | (pl.col("p_gap") <= margin) | (pl.col("p_eff") >= threshold + 0.06)
+        )
+
     return df.select("s1_id", "cand_id")
 
 

@@ -117,18 +117,23 @@ def _lists(df: pl.DataFrame, a_ids: pl.DataFrame, b_ids: pl.DataFrame, col: str,
 
 
 def stage_output(norm_dir: str, model_dir: str, work_dir: str, country: str) -> None:
-    from scoring import decide_frame
+    from scoring import decide_robust_frame
     cfg = json.load(open(f"{model_dir}/config.json"))
-    a_ids = _load(norm_dir, "a", ["entity_id"], country)
-    b_ids = _load(norm_dir, "b", ["entity_id"], country).rename({"entity_id": "cand"})
+    a_meta = _load(norm_dir, "a", ["entity_id", "name_compact", "house_no", "state"], country)
+    b_meta = _load(norm_dir, "b", ["entity_id", "name_compact", "house_no", "state"], country)
+    a_ids = a_meta.select("a_idx", "entity_id")
+    b_ids = b_meta.select("b_idx", cand=pl.col("entity_id"))
+
     scored = pl.read_parquet(f"{work_dir}/test_scored_{country}.parquet").rename({"a_idx": "s1_id", "b_idx": "cand_id"})
-    matches = decide_frame(scored, cfg["threshold"], cfg["one_to_one"]).rename({"s1_id": "a_idx", "cand_id": "b_idx"})
-    del scored
+    matches = decide_robust_frame(scored, a_meta, b_meta, cfg.get("threshold", 0.68), cfg.get("one_to_one", True), margin=0.03).rename({"s1_id": "a_idx", "cand_id": "b_idx"})
+    del scored, a_meta, b_meta
+
     m = _lists(matches, a_ids, b_ids, "matched_entity_ids", desc=f"Matches [{country}]")
     m.write_csv(f"{work_dir}/out_matches_{country}.tsv", separator="\t", quote_style="never")
     n_ent = (m["matched_entity_ids"] != "").sum()
     print(f"[{country}] Matches: {matches.height:,} pairs for {n_ent:,} entities; {m.height - n_ent:,} singletons", flush=True)
     del matches, m
+
     pairs = pl.read_parquet(f"{work_dir}/test_pairs_{country}.parquet", columns=["a_idx", "b_idx"])
     c = _lists(pairs, a_ids, b_ids, "candidate_entity_ids", desc=f"Candidates [{country}]")
     c.write_csv(f"{work_dir}/out_cands_{country}.tsv", separator="\t", quote_style="never")
