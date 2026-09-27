@@ -60,8 +60,11 @@ def stage_block(norm_dir: str, work_dir: str, threads: int, country: str) -> Non
 
 
 def stage_score(norm_dir: str, model_dir: str, work_dir: str, n_jobs: int, threads: int, country: str) -> None:
+    import gc
     import lightgbm as lgb
+    from tqdm import tqdm
     from features import A_COLS, B_COLS, FEATURE_COLS, build_features, context_frames, iter_chunks
+
     t0 = time.time()
     a = _load(norm_dir, "a", A_COLS, country)
     b = _load(norm_dir, "b", B_COLS, country)
@@ -69,30 +72,44 @@ def stage_score(norm_dir: str, model_dir: str, work_dir: str, n_jobs: int, threa
     a_key = a.select("a_idx", "country", "state")
     del a, b
     pairs = pl.read_parquet(f"{work_dir}/test_pairs_{country}.parquet")
+    total_pairs = pairs.height
     model = lgb.Booster(model_file=f"{model_dir}/model.txt")
     parts = []
+    chunks = list(iter_chunks(pairs, a_key))
+
     with Pool(n_jobs) as pool:
-        for i, ch in enumerate(iter_chunks(pairs, a_key)):
-            ck = f"{work_dir}/test_scored_{country}_chunk{i:03d}.parquet"
-            if os.path.exists(ck):  # checkpoint from an interrupted run
-                parts.append(pl.read_parquet(ck))
-                print(f"[{country}] chunk {i}: reusing checkpoint", flush=True)
-                continue
-            f = build_features(ch, a_ctx, b_ctx, pool, n_jobs=n_jobs)
-            p = model.predict(f.select(FEATURE_COLS).to_numpy(), num_threads=threads)
-            part = f.select("a_idx", "b_idx").with_columns(p=pl.Series(p, dtype=pl.Float32))
-            part.write_parquet(ck)
-            parts.append(part)
-            print(f"[{country}] chunk {i}: {ch.height:,} pairs scored, t={time.time() - t0:.0f}s", flush=True)
-            del f
+        with tqdm(total=total_pairs, desc=f"Scoring [{country}]", unit="pair", dynamic_ncols=True) as pbar:
+            for i, ch in enumerate(chunks):
+                ck = f"{work_dir}/test_scored_{country}_chunk{i:03d}.parquet"
+                if os.path.exists(ck):  # checkpoint from an interrupted run
+                    part = pl.read_parquet(ck)
+                    parts.append(part)
+                    pbar.update(ch.height)
+                    continue
+
+                f = build_features(ch, a_ctx, b_ctx, pool, n_jobs=n_jobs)
+                feat_matrix = f.select(FEATURE_COLS).to_numpy()
+                p = model.predict(feat_matrix, num_threads=threads)
+                part = f.select("a_idx", "b_idx").with_columns(p=pl.Series(p, dtype=pl.Float32))
+                part.write_parquet(ck)
+                parts.append(part)
+                pbar.update(ch.height)
+                del f, feat_matrix, p
+                gc.collect()
+
     scored = pl.concat(parts)
     scored.write_parquet(f"{work_dir}/test_scored_{country}.parquet")
     for ck in glob.glob(f"{work_dir}/test_scored_{country}_chunk*.parquet"):
-        os.remove(ck)
-    print(f"[{country}] scored {scored.height:,} pairs in {time.time() - t0:.0f}s", flush=True)
+        try:
+            os.remove(ck)
+        except OSError:
+            pass
+    print(f"[{country}] Scored {scored.height:,} pairs in {time.time() - t0:.0f}s", flush=True)
 
 
-def _lists(df: pl.DataFrame, a_ids: pl.DataFrame, b_ids: pl.DataFrame, col: str) -> pl.DataFrame:
+def _lists(df: pl.DataFrame, a_ids: pl.DataFrame, b_ids: pl.DataFrame, col: str, desc: str = "") -> pl.DataFrame:
+    from tqdm import tqdm
+    print(f"  Formatting {col} ({df.height:,} rows)...", flush=True)
     g = (df.join(b_ids, on="b_idx").group_by("a_idx")
            .agg(pl.col("cand").sort().str.join(",").alias(col)))
     return (a_ids.join(g, on="a_idx", how="left").with_columns(pl.col(col).fill_null(""))
@@ -107,29 +124,32 @@ def stage_output(norm_dir: str, model_dir: str, work_dir: str, country: str) -> 
     scored = pl.read_parquet(f"{work_dir}/test_scored_{country}.parquet").rename({"a_idx": "s1_id", "b_idx": "cand_id"})
     matches = decide_frame(scored, cfg["threshold"], cfg["one_to_one"]).rename({"s1_id": "a_idx", "cand_id": "b_idx"})
     del scored
-    m = _lists(matches, a_ids, b_ids, "matched_entity_ids")
+    m = _lists(matches, a_ids, b_ids, "matched_entity_ids", desc=f"Matches [{country}]")
     m.write_csv(f"{work_dir}/out_matches_{country}.tsv", separator="\t", quote_style="never")
     n_ent = (m["matched_entity_ids"] != "").sum()
-    print(f"[{country}] matches: {matches.height:,} pairs for {n_ent:,} entities; {m.height - n_ent:,} singletons", flush=True)
+    print(f"[{country}] Matches: {matches.height:,} pairs for {n_ent:,} entities; {m.height - n_ent:,} singletons", flush=True)
     del matches, m
     pairs = pl.read_parquet(f"{work_dir}/test_pairs_{country}.parquet", columns=["a_idx", "b_idx"])
-    c = _lists(pairs, a_ids, b_ids, "candidate_entity_ids")
+    c = _lists(pairs, a_ids, b_ids, "candidate_entity_ids", desc=f"Candidates [{country}]")
     c.write_csv(f"{work_dir}/out_cands_{country}.tsv", separator="\t", quote_style="never")
-    print(f"[{country}] candidates: {pairs.height:,} pairs written", flush=True)
+    print(f"[{country}] Candidates: {pairs.height:,} pairs written", flush=True)
 
 
 def merge_outputs(work_dir: str, out_dir: str, cs: list[str]) -> None:
+    from tqdm import tqdm
     os.makedirs(out_dir, exist_ok=True)
     for kind, name in (("matches", "matching_results.tsv"), ("cands", "candidate_pairs.tsv")):
+        print(f"Merging {name} for countries {cs}...", flush=True)
         with open(f"{out_dir}/{name}", "w", encoding="utf-8") as out:
             for i, c in enumerate(cs):
-                with open(f"{work_dir}/out_{kind}_{c}.tsv", encoding="utf-8") as fh:
+                fpath = f"{work_dir}/out_{kind}_{c}.tsv"
+                with open(fpath, encoding="utf-8") as fh:
                     header = fh.readline()
                     if i == 0:
                         out.write(header)
                     for line in fh:
                         out.write(line)
-    print(f"merged outputs -> {out_dir}", flush=True)
+    print(f"Merged outputs successfully -> {out_dir}", flush=True)
 
 
 if __name__ == "__main__":
@@ -153,15 +173,17 @@ if __name__ == "__main__":
                 marker = {"block": f"test_pairs_{c}.parquet", "score": f"test_scored_{c}.parquet",
                           "output": f"out_cands_{c}.tsv"}[st]
                 if args.skip_existing and os.path.exists(f"{args.work_dir}/{marker}"):
-                    print(f"=== stage {st} {c}: reusing {marker}", flush=True)
+                    print(f"=== Stage {st} [{c}]: Reusing {marker} (Skip existing) ===", flush=True)
                     continue
-                print(f"=== stage {st} {c} {time.strftime('%H:%M:%S')}", flush=True)
+                print(f"\n=======================================================", flush=True)
+                print(f"=== Stage {st.upper()} [{c}] - {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
+                print(f"=======================================================", flush=True)
                 cmd = [sys.executable, __file__, "--stage", st, "--country", c, "--norm-dir", args.norm_dir,
                        "--model-dir", args.model_dir, "--out-dir", args.out_dir, "--work-dir", args.work_dir,
                        "--jobs", str(args.jobs), "--threads", str(args.threads)]
                 subprocess.run(cmd, check=True)
         merge_outputs(args.work_dir, args.out_dir, cs)
-        print(f"=== done {time.strftime('%H:%M:%S')}", flush=True)
+        print(f"\n=== Pipeline Completed Successfully at {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
     elif args.stage == "block":
         stage_block(args.norm_dir, args.work_dir, args.threads, args.country)
     elif args.stage == "score":

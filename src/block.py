@@ -87,8 +87,11 @@ def run_blocking(a: pl.DataFrame, b: pl.DataFrame, top_name: int = 20, top_addr:
     per Source 2/3 record so that every candidate record reaches at least a few
     reference entities even inside dense same-name neighbourhoods.
 
-    Returns a frame with columns s1_id, cand_id, sim_name, sim_addr.
+    Returns a frame with columns a_idx, b_idx, sim_name, sim_addr.
     """
+    import gc
+    from tqdm import tqdm
+
     keep = ["country", "state", "name_compact", "addr_norm", "addr_nums"]
     a = a.select(keep).with_row_index("a_idx").with_columns(state=_partition_key(pl.col("state")))
     b = b.select(keep).with_row_index("b_idx").with_columns(state=_partition_key(pl.col("state")))
@@ -96,12 +99,16 @@ def run_blocking(a: pl.DataFrame, b: pl.DataFrame, top_name: int = 20, top_addr:
     a = a.with_columns(addr_text=(pl.col("addr_norm") + " " + pl.col("addr_nums")).str.strip_chars())
     out_parts = []
     t0 = time.time()
+    total_pairs = 0
+
     for country in a["country"].unique().sort():
         a_c = a.filter(pl.col("country") == country)
         b_c = b.filter(pl.col("country") == country)
         b_nostate = b_c.filter(pl.col("state") == "")
         states = a_c["state"].unique().sort().to_list()
-        for st in states:
+
+        pbar = tqdm(states, desc=f"Blocking {country}", unit="state", dynamic_ncols=True)
+        for st in pbar:
             a_s = a_c.filter(pl.col("state") == st)
             if st == "":
                 b_s = b_c
@@ -125,13 +132,14 @@ def run_blocking(a: pl.DataFrame, b: pl.DataFrame, top_name: int = 20, top_addr:
                     part_parts.append(pl.DataFrame({"a_idx": a_idx[r], "b_idx": b_idx[c],
                                                     "sim_name": np.zeros(len(r), np.float32), "sim_addr": s}))
             if part_parts:
-                # a Source 1 row lives in exactly one partition, so de-duplicating here is complete
-                out_parts.append(pl.concat(part_parts).group_by("a_idx", "b_idx")
-                                 .agg(pl.col("sim_name").max(), pl.col("sim_addr").max())
-                                 .with_columns(pl.col("a_idx").cast(pl.UInt32), pl.col("b_idx").cast(pl.UInt32)))
-            if verbose:
-                print(f"  {country:6} {st or '--':4} A={a_s.height:>7,} B={b_s.height:>9,} "
-                      f"pairs={sum(p.height for p in out_parts):>11,} t={time.time() - t0:7.1f}s", flush=True)
+                dedup = (pl.concat(part_parts).group_by("a_idx", "b_idx")
+                         .agg(pl.col("sim_name").max(), pl.col("sim_addr").max())
+                         .with_columns(pl.col("a_idx").cast(pl.UInt32), pl.col("b_idx").cast(pl.UInt32)))
+                out_parts.append(dedup)
+                total_pairs += dedup.height
+            pbar.set_postfix({"pairs": f"{total_pairs:,}", "curr_st": st or "--"})
+            gc.collect()
+
     if not out_parts:
         return pl.DataFrame({"a_idx": pl.Series([], dtype=pl.UInt32), "b_idx": pl.Series([], dtype=pl.UInt32),
                              "sim_name": pl.Series([], dtype=pl.Float32), "sim_addr": pl.Series([], dtype=pl.Float32)})

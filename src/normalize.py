@@ -402,25 +402,40 @@ def _worker(args):
 
 
 def normalize_file(path: str, out_path: str, translit_path: str | None = None, n_jobs: int = 8,
-                   chunk: int = 50_000) -> None:
+                   chunk: int = 50_000, skip_existing: bool = False) -> None:
     import polars as pl
     from multiprocessing import Pool
+    from tqdm import tqdm
 
+    if skip_existing and os.path.exists(out_path):
+        print(f"Skipping already normalized file: {out_path}", flush=True)
+        return
+
+    fname = os.path.basename(path)
     df = pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False)
     df = df.fill_null("")
+    total_rows = df.height
     rows = list(zip(df["entity_id"], df["business_name"], df["business_address"], df["country"]))
     del df
-    chunks = ((rows[i:i + chunk], translit_path) for i in range(0, len(rows), chunk))
+
+    n_chunks = (total_rows + chunk - 1) // chunk
+    chunks = ((rows[i:i + chunk], translit_path) for i in range(0, total_rows, chunk))
     parts = []
     n = 0
+
     with Pool(n_jobs) as pool:
-        for res in pool.imap(_worker, chunks, chunksize=1):
-            parts.append(pl.DataFrame(res).with_columns(pl.col("name_domain").cast(pl.Int8),
-                                                        pl.col("addr_missing").cast(pl.Int8)))
-            n += len(res)
+        with tqdm(total=total_rows, desc=f"Normalizing {fname}", unit="rec", dynamic_ncols=True) as pbar:
+            for res in pool.imap(_worker, chunks, chunksize=1):
+                parts.append(pl.DataFrame(res).with_columns(
+                    pl.col("name_domain").cast(pl.Int8),
+                    pl.col("addr_missing").cast(pl.Int8)
+                ))
+                pbar.update(len(res))
+                n += len(res)
+
     res_df = pl.concat(parts)
     res_df.write_parquet(out_path)
-    print(f"normalised {n:,} records from {os.path.basename(path)} -> {out_path}", flush=True)
+    print(f"Normalised {n:,} records from {fname} -> {out_path}", flush=True)
 
 
 if __name__ == "__main__":
@@ -431,8 +446,11 @@ if __name__ == "__main__":
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--translit", default=None)
     ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--chunk", type=int, default=50000)
+    ap.add_argument("--skip-existing", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     for p in a.inputs:
         stem = os.path.splitext(os.path.basename(p))[0]
-        normalize_file(p, os.path.join(a.out_dir, stem + ".parquet"), a.translit, a.jobs)
+        normalize_file(p, os.path.join(a.out_dir, stem + ".parquet"), a.translit, a.jobs,
+                       chunk=a.chunk, skip_existing=a.skip_existing)

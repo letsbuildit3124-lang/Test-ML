@@ -24,7 +24,7 @@ number of string pairs is materialised at any time.
 from __future__ import annotations
 
 from multiprocessing import Pool
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 import polars as pl
@@ -145,28 +145,36 @@ def iter_chunks(pairs: pl.DataFrame, a: pl.DataFrame, max_rows: int = 1_500_000)
         yield p.filter(pl.col("part").is_in(g)).drop("part")
 
 
-def build_features(pairs: pl.DataFrame, a_ctx: pl.DataFrame, b_ctx: pl.DataFrame, pool: Pool,
-                   chunk: int = 100_000, n_jobs: int = 8) -> pl.DataFrame:
+def build_features(pairs: pl.DataFrame, a_ctx: pl.DataFrame, b_ctx: pl.DataFrame, pool: Pool | None = None,
+                   chunk: int = 100_000, n_jobs: int = 8, pbar: Any = None) -> pl.DataFrame:
     """pairs: a_idx, b_idx, sim_name, sim_addr (one partition chunk)."""
     a_r = a_ctx.rename({c: c + "_a" for c in A_COLS})
     b_r = b_ctx.rename({c: c + "_b" for c in B_COLS})
     cols = [c + "_a" for c in STR_COLS] + [c + "_b" for c in STR_COLS]
     mats, outs = [], []
-    step = chunk * n_jobs * 2
-    # join the string columns slice by slice so that memory stays bounded whatever the chunk size
+    step = chunk * max(n_jobs, 1) * 2
+
+    # join the string columns slice by slice so that memory stays bounded
     for i in range(0, pairs.height, step):
         sl = pairs.slice(i, step).join(a_r, on="a_idx", how="inner").join(b_r, on="b_idx", how="inner")
         tasks = []
         for j in range(0, sl.height, chunk):
             s2 = sl.slice(j, chunk)
             tasks.append(list(zip(*[s2[c].to_list() for c in cols])))
-        mats.extend(pool.map(_worker, tasks))
+        if pool is not None and n_jobs > 1:
+            mats.extend(pool.map(_worker, tasks))
+        else:
+            mats.extend([_worker(t) for t in tasks])
+
         outs.append(sl.select("a_idx", "b_idx", "sim_name", "sim_addr", pl.col("country_a").alias("country"),
                               "amb_name", "amb_addr",
                               (pl.col("name_script_b") != "latin").cast(pl.Float32).alias("b_nonlatin"),
                               pl.col("name_domain_b").cast(pl.Float32).alias("b_domain"),
                               pl.col("addr_missing_b").cast(pl.Float32).alias("b_addr_missing")))
+        if pbar is not None:
+            pbar.update(sl.height)
         del sl
+
     fm = np.concatenate(mats) if mats else np.zeros((0, len(PAIR_COLS)), np.float32)
     del mats
     out = pl.concat(outs) if outs else pl.DataFrame()
@@ -201,7 +209,7 @@ if __name__ == "__main__":
     import argparse
     import os
     import time
-
+    from tqdm import tqdm
     from block import gt_pairs_idx
 
     ap = argparse.ArgumentParser()
@@ -232,15 +240,17 @@ if __name__ == "__main__":
     del a_full, b
     t0 = time.time()
     total = 0
+    chunks = list(iter_chunks(pairs, a))
+
     with Pool(args.jobs) as pool:
-        for i, ch in enumerate(iter_chunks(pairs, a)):
-            f = build_features(ch, a_ctx, b_ctx, pool, n_jobs=args.jobs)
-            if truth is not None:
-                f = f.join(truth, on=["a_idx", "b_idx"], how="left").with_columns(pl.col("y").fill_null(0))
-                if args.neg_frac < 1.0:
-                    keep = (pl.col("y") == 1) | (pl.int_range(pl.len()).shuffle(seed=args.seed + i) < pl.len() * args.neg_frac)
-                    f = f.filter(keep)
-            f.write_parquet(f"{args.out_dir}/part_{i:03d}.parquet")
-            total += f.height
-            print(f"  chunk {i}: {ch.height:,} pairs -> {f.height:,} rows kept, t={time.time() - t0:.0f}s", flush=True)
-    print(f"features: {total:,} rows x {len(FEATURE_COLS)} features -> {args.out_dir}")
+        with tqdm(total=pairs.height, desc=f"Features [{args.country or 'all'}]", unit="pair", dynamic_ncols=True) as pbar:
+            for i, ch in enumerate(chunks):
+                f = build_features(ch, a_ctx, b_ctx, pool, n_jobs=args.jobs, pbar=pbar)
+                if truth is not None:
+                    f = f.join(truth, on=["a_idx", "b_idx"], how="left").with_columns(pl.col("y").fill_null(0))
+                    if args.neg_frac < 1.0:
+                        keep = (pl.col("y") == 1) | (pl.int_range(pl.len()).shuffle(seed=args.seed + i) < pl.len() * args.neg_frac)
+                        f = f.filter(keep)
+                f.write_parquet(f"{args.out_dir}/part_{i:03d}.parquet")
+                total += f.height
+    print(f"Features: {total:,} rows x {len(FEATURE_COLS)} features -> {args.out_dir}")
