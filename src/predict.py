@@ -188,5 +188,10 @@ if __name__ == "__main__":
         stage_block(args.norm_dir, args.work_dir, args.threads, args.country)
     elif args.stage == "score":
         stage_score(args.norm_dir, args.model_dir, args.work_dir, args.jobs, args.threads, args.country)
-    else:
-        stage_output(args.norm_dir, args.model_dir, args.work_dir, args.country)
+    elif args.stage == "output":
+        cs = [args.country] if args.country else countries(args.norm_dir)
+        for c in cs:
+            stage_output(args.norm_dir, args.model_dir, args.work_dir, c)
+        if args.country is None:
+            merge_outputs(args.work_dir, args.out_dir, cs)
+            print(f"\n=== Output Generation & Merge Completed Successfully at {time.strftime('%Y-%m-%d %H:%M:%S')} ===", flush=True)
