@@ -119,13 +119,14 @@ def _lists(df: pl.DataFrame, a_ids: pl.DataFrame, b_ids: pl.DataFrame, col: str,
 def stage_output(norm_dir: str, model_dir: str, work_dir: str, country: str) -> None:
     from scoring import decide_robust_frame
     cfg = json.load(open(f"{model_dir}/config.json"))
-    a_meta = _load(norm_dir, "a", ["entity_id", "name_compact", "house_no", "state"], country)
-    b_meta = _load(norm_dir, "b", ["entity_id", "name_compact", "house_no", "state"], country)
+    meta_cols = ["entity_id", "name_compact", "name_core", "house_no", "state", "addr_missing", "addr_nums"]
+    a_meta = _load(norm_dir, "a", meta_cols, country)
+    b_meta = _load(norm_dir, "b", meta_cols, country)
     a_ids = a_meta.select("a_idx", "entity_id")
     b_ids = b_meta.select("b_idx", cand=pl.col("entity_id"))
 
     scored = pl.read_parquet(f"{work_dir}/test_scored_{country}.parquet").rename({"a_idx": "s1_id", "b_idx": "cand_id"})
-    matches = decide_robust_frame(scored, a_meta, b_meta, cfg.get("threshold", 0.68), cfg.get("one_to_one", True), margin=0.03).rename({"s1_id": "a_idx", "cand_id": "b_idx"})
+    matches = decide_robust_frame(scored, a_meta, b_meta, cfg.get("threshold", 0.67), cfg.get("one_to_one", True), margin=0.03).rename({"s1_id": "a_idx", "cand_id": "b_idx"})
     del scored, a_meta, b_meta
 
     m = _lists(matches, a_ids, b_ids, "matched_entity_ids", desc=f"Matches [{country}]")

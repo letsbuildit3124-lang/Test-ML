@@ -47,39 +47,65 @@ def decide(scored: pl.DataFrame, threshold: float = 0.68, one_to_one: bool = Tru
 
 
 def decide_robust_frame(scored: pl.DataFrame, a_meta: pl.DataFrame, b_meta: pl.DataFrame,
-                        threshold: float = 0.68, one_to_one: bool = True,
+                        threshold: float = 0.67, one_to_one: bool = True,
                         margin: float = 0.03) -> pl.DataFrame:
-    """Multi-Layer Robust Decision Engine for Maximizing Macro F0.5.
+    """Advanced Multi-Factor Decision Intelligence Engine for Macro F0.5.
 
-    1. Joins metadata to inspect house numbers, exact compact names, and states.
-    2. Layer A (Distractor Rejection): Conflicting house numbers penalized (p_eff = p - 0.14).
-    3. Layer B (High-Confidence Agreement): Exact compact names & matching states boosted (p_eff = p + 0.04).
-    4. Layer C (Optimal Boundary): Filters p_eff >= threshold.
-    5. Layer D (1-to-1 Argmax): Assigns candidate uniquely to best S1 entity.
-    6. Layer E (Confidence Margin): Protects singletons from marginal ambiguous matches.
+    1. Distractor Suppression: Conflicting house numbers penalized (-0.16).
+    2. Missing-Address Recovery: Exact names with missing S2/S3 address boosted (+0.12).
+    3. House Number Match Boost: Matching street numbers (+0.05).
+    4. Exact Compact Name + State Anchor: (+0.04).
+    5. Reciprocal Top-1 Match Agreement (Mutual Nearest Neighbors): (+0.03).
+    6. Optimal Boundary + 1-to-1 Argmax + Margin Filter.
     """
     if not scored.height:
         return pl.DataFrame({"s1_id": [], "cand_id": []})
 
-    # Join metadata
-    a_m = a_meta.select(s1_id="a_idx", name_cmp_a="name_compact", house_a="house_no", st_a="state")
-    b_m = b_meta.select(cand_id="b_idx", name_cmp_b="name_compact", house_b="house_no", st_b="state")
+    # Select needed columns from metadata
+    a_cols = [c for c in ["name_compact", "name_core", "house_no", "state", "addr_missing", "addr_nums"] if c in a_meta.columns]
+    b_cols = [c for c in ["name_compact", "name_core", "house_no", "state", "addr_missing", "addr_nums"] if c in b_meta.columns]
+
+    a_m = a_meta.select(["a_idx"] + a_cols).rename({"a_idx": "s1_id", **{c: c + "_a" for c in a_cols}})
+    b_m = b_meta.select(["b_idx"] + b_cols).rename({"b_idx": "cand_id", **{c: c + "_b" for c in b_cols}})
 
     df = (scored
           .join(a_m, on="s1_id", how="inner")
           .join(b_m, on="cand_id", how="inner"))
 
-    # Calculate effective probability
-    # If house numbers both exist and conflict: penalty of 0.14
-    is_house_conflict = (pl.col("house_a") != "") & (pl.col("house_b") != "") & (pl.col("house_a") != pl.col("house_b"))
-    # If exact compact name and same state: boost of 0.04
-    is_exact_name_state = (pl.col("name_cmp_a") != "") & (pl.col("name_cmp_a") == pl.col("name_cmp_b")) & ((pl.col("st_a") == "") | (pl.col("st_a") == pl.col("st_b")))
+    # Conditions
+    # 1. House number relations
+    has_house_a = (pl.col("house_no_a") != "")
+    has_house_b = (pl.col("house_no_b") != "")
+    is_house_match = has_house_a & has_house_b & (pl.col("house_no_a") == pl.col("house_no_b"))
+    is_house_conflict = has_house_a & has_house_b & (pl.col("house_no_a") != pl.col("house_no_b"))
 
+    # 2. Exact compact name agreement
+    has_name = (pl.col("name_compact_a") != "") & (pl.col("name_compact_b") != "")
+    is_exact_name = has_name & (pl.col("name_compact_a") == pl.col("name_compact_b"))
+    is_same_state = (pl.col("state_a") == "") | (pl.col("state_b") == "") | (pl.col("state_a") == pl.col("state_b"))
+
+    # 3. Missing address recovery in S2/S3 (addresses the 41% false negatives)
+    is_b_missing_addr = (pl.col("addr_missing_b") == 1) if "addr_missing_b" in df.columns else pl.lit(False)
+    is_name_match_no_addr = is_b_missing_addr & is_exact_name & is_same_state
+
+    # 4. Reciprocal best match (mutual rank 1)
     df = df.with_columns(
-        p_eff=(pl.col("p")
-               - pl.when(is_house_conflict).then(0.14).otherwise(0.0)
-               + pl.when(is_exact_name_state).then(0.04).otherwise(0.0))
+        rank_for_s1=pl.col("p").rank("min", descending=True).over("s1_id"),
+        rank_for_cand=pl.col("p").rank("min", descending=True).over("cand_id")
     )
+    is_reciprocal_best = (pl.col("rank_for_s1") == 1) & (pl.col("rank_for_cand") == 1)
+
+    # Effective probability calculation
+    p_eff_expr = (
+        pl.col("p")
+        - pl.when(is_house_conflict).then(0.16).otherwise(0.0)
+        + pl.when(is_house_match).then(0.05).otherwise(0.0)
+        + pl.when(is_exact_name & is_same_state).then(0.04).otherwise(0.0)
+        + pl.when(is_name_match_no_addr).then(0.12).otherwise(0.0)
+        + pl.when(is_reciprocal_best).then(0.03).otherwise(0.0)
+    ).clip(0.0, 1.0)
+
+    df = df.with_columns(p_eff=p_eff_expr)
 
     # Filter by threshold
     df = df.filter(pl.col("p_eff") >= threshold)
