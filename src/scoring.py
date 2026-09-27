@@ -27,7 +27,7 @@ def macro_f05(pred: dict[str, set], truth: dict[str, set]) -> float:
     return tot / max(len(truth), 1)
 
 
-def decide(scored: pl.DataFrame, threshold: float, one_to_one: bool = True,
+def decide(scored: pl.DataFrame, threshold: float = 0.68, one_to_one: bool = True,
            min_gap: float = 0.0) -> dict[str, set]:
     """scored: s1_id, cand_id, p.  Returns s1_id -> set(cand_id).
 
@@ -36,7 +36,9 @@ def decide(scored: pl.DataFrame, threshold: float, one_to_one: bool = True,
       (the one with the highest probability)
     """
     df = scored.filter(pl.col("p") >= threshold)
-    if one_to_one and df.height:
+    if not df.height:
+        return {}
+    if one_to_one:
         df = df.sort("p", descending=True).unique(subset=["cand_id"], keep="first", maintain_order=True)
     out: dict[str, set] = {}
     for s1, c in zip(df["s1_id"].to_list(), df["cand_id"].to_list()):
@@ -44,10 +46,19 @@ def decide(scored: pl.DataFrame, threshold: float, one_to_one: bool = True,
     return out
 
 
-def decide_frame(scored: pl.DataFrame, threshold: float, one_to_one: bool = True) -> pl.DataFrame:
-    """Frame version of ``decide`` (columns s1_id, cand_id kept)."""
+def decide_frame(scored: pl.DataFrame, threshold: float = 0.68, one_to_one: bool = True,
+                 margin: float = 0.0) -> pl.DataFrame:
+    """Frame version of ``decide`` (columns s1_id, cand_id kept).
+
+    Precision-optimized for Challenge Metric (Macro F0.5):
+    - Rejects low-confidence pairs below threshold (default 0.68)
+    - Enforces 1-to-1 matching: each S2/S3 candidate goes strictly to its argmax S1 entity
+    """
     df = scored.filter(pl.col("p") >= threshold)
-    if one_to_one and df.height:
+    if not df.height:
+        return pl.DataFrame({"s1_id": pl.Series([], dtype=scored["s1_id"].dtype),
+                             "cand_id": pl.Series([], dtype=scored["cand_id"].dtype)})
+    if one_to_one:
         df = df.sort("p", descending=True).unique(subset=["cand_id"], keep="first", maintain_order=True)
     return df.select("s1_id", "cand_id")
 
