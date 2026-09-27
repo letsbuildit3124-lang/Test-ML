@@ -1,0 +1,15 @@
+indic_transliteration==2.3.82
+jellyfish==1.2.1
+lightgbm==4.7.0
+numpy==2.5.3
+pandas==3.0.6
+polars==1.44.2
+polars-runtime-32==1.44.2
+pyarrow==25.0.1
+RapidFuzz==3.14.6
+scikit-learn==1.9.1
+scipy==1.18.1
+sparse-dot-topn==1.2.0
+tqdm==4.70.1
+Unidecode==1.4.0
+# interpreter: Python 3.14.7

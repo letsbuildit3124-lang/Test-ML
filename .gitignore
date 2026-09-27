@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+# large regenerable intermediates and outputs live outside the repo
+work/*
+!work/translit.json
+!work/model/
+work/model/*
+!work/model/model.txt
+!work/model/config.json
+output/
+dataset/
+*.zip
+*.parquet
+*.log
